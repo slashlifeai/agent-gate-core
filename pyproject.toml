@@ -1,0 +1,8 @@
+[project]
+name = "agent-gate-core"
+version = "0.1.0"
+description = "Evidence normalization and deterministic verdict reduction for AI-agent incident replay."
+requires-python = ">=3.9"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

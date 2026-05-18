@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+
+SCHEMA_VERSION = "agent.gate.result.v0"
+
+
+def deterministic_signature(payload):
+    # Content-bound signature.  The demo node has no Ed25519 private key,
+    # so we cannot produce a real signature here — but the verdict bundle
+    # is uniquely identified by a sha256 over its sorted JSON, and a
+    # production deployment would replace this with a real Ed25519 sign of
+    # exactly the same canonical bytes.  Format mirrors `ed25519:<hex>`
+    # so downstream tooling and humans recognise the shape.
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"ed25519:{digest[:16]}…{digest[-16:]}"
+
+
+def print_verdict(verdict, reason, policy, signature):
+    print(f"VERDICT: {verdict}")
+    print(f"reason: {reason}")
+    print(f"policy: {policy}")
+    print(f"signature: {signature}")
+
+
+def fail(reason, policy, results=()):
+    payload = json.dumps(
+        {"verdict": "FAIL", "reason": reason, "policy": policy, "results": list(results)},
+        sort_keys=True,
+    )
+    print_verdict("FAIL", reason, policy, deterministic_signature(payload))
+    return 1
+
+
+def load_result(path):
+    try:
+        with path.open(encoding="utf-8") as handle:
+            return json.load(handle), None
+    except FileNotFoundError:
+        return None, f"missing result file: {path}"
+    except json.JSONDecodeError as error:
+        return None, f"invalid JSON result file: {path}: {error}"
+    except OSError as error:
+        return None, f"unreadable result file: {path}: {error}"
+
+
+def violation_policy(violation):
+    return violation.get("policy") or violation.get("policy_id") or "unknown"
+
+
+def decide(paths):
+    if not paths:
+        return fail("no execution results provided", "agent-gate.missing-evidence")
+
+    loaded = []
+    for raw_path in paths:
+        path = Path(raw_path)
+        result, error = load_result(path)
+        if error:
+            return fail(error, "agent-gate.missing-evidence", loaded)
+        loaded.append(result)
+
+        node = result.get("node") or str(path)
+        if result.get("schema_version") != SCHEMA_VERSION:
+            return fail(f"{node}: invalid gate result schema", "agent-gate.invalid-schema", loaded)
+
+        execution = result.get("execution")
+        if not isinstance(execution, dict):
+            return fail(f"{node}: missing execution evidence", "agent-gate.invalid-evidence", loaded)
+
+        if execution.get("audit_valid") is not True:
+            return fail(f"{node}: audit evidence invalid", "agent-gate.audit-invalid", loaded)
+
+        violations = result.get("policy_violations", [])
+        if not isinstance(violations, list):
+            return fail(
+                f"{node}: invalid policy violation evidence",
+                "agent-gate.invalid-evidence",
+                loaded,
+            )
+
+        for violation in violations:
+            if not isinstance(violation, dict):
+                return fail(
+                    f"{node}: invalid policy violation evidence",
+                    "agent-gate.invalid-evidence",
+                    loaded,
+                )
+            if violation.get("severity") == "CRITICAL":
+                reason = violation.get("message") or "critical policy violation"
+                return fail(f"{node}: {reason}", violation_policy(violation), loaded)
+
+    pass_payload = json.dumps(
+        {
+            "verdict": "PASS",
+            "reason": "all provided node results completed without CRITICAL policy violations",
+            "policy": "none",
+            "results": loaded,
+        },
+        sort_keys=True,
+    )
+    print_verdict(
+        "PASS",
+        "all provided node results completed without CRITICAL policy violations",
+        "none",
+        deterministic_signature(pass_payload),
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(decide(sys.argv[1:]))

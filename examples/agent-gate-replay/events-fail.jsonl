@@ -1,0 +1,1 @@
+{"type":"ledger:RuntimeLedgerEvent","intent":"runtime:AccessDenied","policyId":"sl.ai.policy.credential-access","severity":"critical","executionContext":{"syscall":"openat","detail":"/run/homomorphix/credentials/agent-x/codex-api-key.env","action":"denied"}}

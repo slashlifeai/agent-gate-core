@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+
+SCHEMA_VERSION = "agent.gate.result.v0"
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Run one agent/tool through audit and emit agent.gate.result.v0 JSON."
+    )
+    parser.add_argument("--node", required=True)
+    parser.add_argument("--tool", required=True)
+    parser.add_argument("--agent-id")
+    parser.add_argument("--policy-result", required=True)
+    parser.add_argument("--audit-bin", default="wfaudit")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if args.command and args.command[0] == "--":
+        args.command = args.command[1:]
+    if not args.command:
+        parser.error("command is required after --")
+    return args
+
+
+def load_json_file(path):
+    with Path(path).open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def parse_json_output(stdout, command_name):
+    decoder = json.JSONDecoder()
+    stripped = stdout.strip()
+    if not stripped:
+        raise SystemExit(f"{command_name} did not emit JSON")
+
+    parsed = None
+    for index, char in enumerate(stripped):
+        if char not in "[{":
+            continue
+        try:
+            candidate, end = decoder.raw_decode(stripped[index:])
+        except json.JSONDecodeError:
+            continue
+        if stripped[index + end :].strip():
+            continue
+        parsed = candidate
+    if parsed is None:
+        raise SystemExit(f"{command_name} did not emit JSON")
+    return parsed
+
+
+def policy_violations(policy_result):
+    if isinstance(policy_result, list):
+        raw_violations = policy_result
+    elif isinstance(policy_result, dict):
+        raw_violations = policy_result.get("policy_violations", [])
+    else:
+        raise SystemExit("policy result must be a JSON object or array")
+
+    if not isinstance(raw_violations, list):
+        raise SystemExit("policy_result.policy_violations must be an array")
+
+    violations = []
+    for violation in raw_violations:
+        if not isinstance(violation, dict):
+            raise SystemExit("policy violations must be JSON objects")
+        violations.append(
+            {
+                "policy": violation.get("policy")
+                or violation.get("policy_id")
+                or "unknown",
+                "severity": violation.get("severity") or "UNKNOWN",
+                "message": violation.get("message") or "",
+            }
+        )
+    return violations
+
+
+def run(argv):
+    args = parse_args(argv)
+
+    audit_run = subprocess.run(
+        [
+            args.audit_bin,
+            "run",
+            "--agent-tool",
+            args.tool,
+            "--summary-format",
+            "json",
+            "--",
+            *args.command,
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if not audit_run.stdout.strip():
+        sys.stderr.write(audit_run.stderr)
+        return audit_run.returncode or 1
+
+    run_summary = parse_json_output(audit_run.stdout, "audit run")
+    audit_session_id = run_summary.get("audit_session_id")
+    if not audit_session_id:
+        raise SystemExit("audit run summary missing audit_session_id")
+
+    audit_report = subprocess.run(
+        [args.audit_bin, "report", audit_session_id, "--format", "json"],
+        text=True,
+        capture_output=True,
+    )
+    if audit_report.returncode != 0:
+        sys.stderr.write(audit_report.stderr)
+        return audit_report.returncode
+
+    report = parse_json_output(audit_report.stdout, "audit report")
+    policy_result = load_json_file(args.policy_result)
+
+    report_process = report.get("summary", {}).get("process", {})
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "node": args.node,
+        "agent_tool": args.tool,
+        "agent_id": args.agent_id or args.tool,
+        "execution": {
+            "exit_code": run_summary.get(
+                "exit_code",
+                report_process.get("exit_code", audit_run.returncode),
+            ),
+            "audit_session_id": audit_session_id,
+            "audit_valid": report.get("verification", {}).get("valid") is True,
+        },
+        "policy_violations": policy_violations(policy_result),
+        "signature": None,
+    }
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(run(sys.argv[1:]))

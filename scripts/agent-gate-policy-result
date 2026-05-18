@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import sys
+from pathlib import Path
+
+
+BLOCKING_ACTIONS = {"denied", "dropped", "rate_limited"}
+BLOCKING_INTENTS = {
+    "runtime:AccessDenied",
+    "runtime:AccessRateLimited",
+    "runtime:PacketDropped",
+}
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        description="Normalize policy/runtime events JSONL into Gate policy-result JSON."
+    )
+    parser.add_argument("events_jsonl", help="Policy/runtime events JSONL file, or - for stdin")
+    return parser.parse_args(argv)
+
+
+def read_lines(path):
+    if path == "-":
+        return sys.stdin
+    return Path(path).open(encoding="utf-8")
+
+
+def normalize_severity(value):
+    if value is None:
+        return "UNKNOWN"
+    return str(value).replace("-", "_").upper()
+
+
+def event_policy(event):
+    return event.get("policy") or event.get("policy_id") or event.get("policyId") or "unknown"
+
+
+def event_context(event):
+    context = event.get("executionContext")
+    if isinstance(context, dict):
+        return context
+    return event
+
+
+def event_action(event, context):
+    raw_action = context.get("action", event.get("action"))
+    if isinstance(raw_action, dict):
+        raw_action = raw_action.get("value")
+    if raw_action is None:
+        return ""
+    return str(raw_action)
+
+
+def is_violation(event):
+    context = event_context(event)
+    action = event_action(event, context).lower()
+    intent = str(event.get("intent") or "")
+    severity = normalize_severity(event.get("severity"))
+    return severity == "CRITICAL" or action in BLOCKING_ACTIONS or intent in BLOCKING_INTENTS
+
+
+def event_message(event):
+    context = event_context(event)
+    intent = str(event.get("intent") or "")
+    syscall = str(context.get("syscall") or event.get("syscall") or "").strip()
+    detail = str(context.get("detail") or event.get("detail") or "").strip()
+    parts = [part for part in [intent, syscall, detail] if part]
+    if parts:
+        return " ".join(parts)
+    return "policy violation"
+
+
+def normalize_event(event):
+    return {
+        "policy": event_policy(event),
+        "severity": normalize_severity(event.get("severity")),
+        "message": event_message(event),
+    }
+
+
+def build_policy_result(path):
+    violations = []
+    with read_lines(path) as lines:
+        for line_number, line in enumerate(lines, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                event = json.loads(stripped)
+            except json.JSONDecodeError as error:
+                raise SystemExit(f"invalid JSONL at line {line_number}: {error}") from error
+            if not isinstance(event, dict):
+                raise SystemExit(f"invalid event at line {line_number}: expected object")
+            if is_violation(event):
+                violations.append(normalize_event(event))
+    return {"policy_violations": violations}
+
+
+def main(argv):
+    args = parse_args(argv)
+    print(json.dumps(build_policy_result(args.events_jsonl), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

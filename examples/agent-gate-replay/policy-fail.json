@@ -1,0 +1,9 @@
+{
+  "policy_violations": [
+    {
+      "policy": "sl.ai.policy.credential-access",
+      "severity": "CRITICAL",
+      "message": "unauthorized credential access"
+    }
+  ]
+}
